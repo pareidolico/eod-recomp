@@ -18,12 +18,17 @@
 #include <string>
 #include <vector>
 
-#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
-#include <xmmintrin.h>
+#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2) || defined(__aarch64__)
+#include "sse_compat.h"  // MXCSR on x86, FPCR.FZ on arm64
 #define HAVE_SSE 1
 #endif
 
 #include "core/config.h"
+#include "platform/display_rect.h"
+#ifdef __APPLE__
+#include "app/macos_app.h"
+#include "app/macos_vulkan.h"
+#endif
 #include "core/cpu.h"
 #include "core/log.h"
 #include "core/memory.h"
@@ -140,7 +145,7 @@ static int save_edit(int argc, char **argv) {
 }
 
 [[noreturn]] void app_exit(int code) {
-    gs_sync();
+    gs_shutdown();  // drains and joins the GS worker (docs/WORKER_SHUTDOWN.md)
     if (const char *path = getenv("EOD_DUMP_RAM")) {  // EE main memory at exit (debugging)
         if (FILE *f = fopen(path, "wb")) {
             std::vector<uint8_t> buf(32u << 20);
@@ -225,6 +230,9 @@ static void on_signal(int sig) {
 }
 
 int main(int argc, char **argv) {
+#ifdef __APPLE__
+    mac_app_init_vulkan(); // before replay, SDL window creation or vkCreateInstance
+#endif
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 #ifdef SIGQUIT
@@ -234,13 +242,16 @@ int main(int argc, char **argv) {
     std::string data_dir;
     // settings: eod.ini next to the executable (--config overrides the path)
     std::string config_path = dir_of(argv[0]) + "/eod.ini";
+#ifdef __APPLE__
+    config_path = mac_app_support() + "/eod.ini";
+#endif
     for (int i = 1; i + 1 < argc; i++)
         if (std::string(argv[i]) == "--config") config_path = argv[i + 1];
     config_load(config_path);
     cfg.width = g_config.width;
     cfg.height = g_config.height;
     cfg.fullscreen = g_config.fullscreen;
-    cfg.aspect = g_config.aspect == "16:9" ? 1 : g_config.aspect == "stretch" ? 2 : 0;
+    cfg.aspect = display_aspect(g_config.aspect);
     cfg.smooth = g_config.smooth_display;
     if (!g_config.data_dir.empty()) data_dir = g_config.data_dir;
     const char *log_spec = getenv("EOD_LOG");
@@ -248,6 +259,10 @@ int main(int argc, char **argv) {
     const char *vu_bench_file = nullptr;
     const char *import_card = nullptr;
     int repeat = 3;
+#ifndef _WIN32
+    bool list_pads = false;
+    int watch_pads = 0;
+#endif
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> const char * {
@@ -278,7 +293,12 @@ int main(int argc, char **argv) {
         else if (a == "--import-save") import_card = next();
         else if (a == "--save-edit") return save_edit(argc - i - 1, argv + i + 1);
         else if (a == "--repeat") repeat = atoi(next());
+#ifndef _WIN32
+        else if (a == "--list-pads") list_pads = true;
+        else if (a == "--watch") watch_pads = atoi(next());
+#endif
         else if (a == "--help" || a == "-h") {
+#ifdef _WIN32
             printf("usage: %s [--data DIR] [--config eod.ini] [--renderer d3d11|software] [--fullscreen|--windowed]\n"
                    "          [--scale N] [--log cats] [--log-file PATH] [--headless] [--frames N]\n"
                    "          [--screenshot-every N] [--screenshot-dir DIR] [--gs-replay FILE [--repeat N]]\n"
@@ -286,11 +306,41 @@ int main(int argc, char **argv) {
                    "          [--save-edit SAVEFILE [money=N] [rep=A,B,POINTS] [option=value]...]\n"
                    "log categories: core kernel thread hw dma gs vif vu sif iop file pad mc snd game all\n",
                    argv[0]);
+#else
+            printf("usage: %s [--data DIR] [--config eod.ini] [--renderer vulkan|software] [--fullscreen|--windowed]\n"
+                   "          [--scale N] [--log cats] [--log-file PATH] [--headless] [--frames N]\n"
+                   "          [--screenshot-every N] [--screenshot-dir DIR] [--gs-replay FILE [--repeat N]]\n"
+                   "          [--vu-bench FILE [--repeat N]] [--import-save PCSX2_CARD.ps2]\n"
+                   "          [--save-edit SAVEFILE [money=N] [rep=A,B,POINTS] [option=value]...]\n"
+                   "       %s --list-pads [--watch SECONDS]   (controllers; no game data needed)\n"
+                   "log categories: core kernel thread hw dma gs vif vu sif iop file pad mc snd game all\n",
+                   argv[0], argv[0]);
+#endif
             return 0;
         }
     }
     log_init(log_spec);
-    if (replay) return gs_replay(replay, repeat);
+#ifndef _WIN32
+    if (list_pads || watch_pads > 0) return platform_list_pads(watch_pads);
+#endif
+#ifdef __APPLE__
+    if (!replay && !vu_bench_file) {
+        // Honor an explicit environment path before trying local disc discovery.
+        if (data_dir.empty()) {
+            const char *env_data = getenv("EOD_DATA");
+            if (env_data && env_data[0]) data_dir = env_data;
+        }
+        bool headless = cfg.headless || (getenv("EOD_HEADLESS") && getenv("EOD_HEADLESS")[0] == '1');
+        if (headless && data_dir.empty()) {
+            for (const auto &candidate : {dir_of(argv[0]), std::string(".")}) {
+                if (disc_check_folder(candidate, {ee_elf_size, ee_elf_crc32}).ok()) { data_dir = candidate; break; }
+            }
+        }
+        if (!mac_app_prepare(data_dir, config_path, headless, {ee_elf_size, ee_elf_crc32})) return 1;
+    }
+#endif
+    platform_configure_display(cfg); // Replay also needs startup aspect, without SDL/device initialization.
+    if (replay) { int result = gs_replay(replay, repeat); gs_shutdown(); return result; }
     if (vu_bench_file) {
         vu_init();
         return vu_bench(vu_bench_file, repeat);
@@ -339,6 +389,7 @@ int main(int argc, char **argv) {
     }
 
     if (!platform_init(cfg)) fatal("platform initialisation failed");
+    platform_thread_fast();  // the EE runs on this thread
     mem_init();
     cpu_init();
     hw_init();

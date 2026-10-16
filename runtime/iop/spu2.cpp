@@ -14,6 +14,7 @@
 #include "../core/log.h"
 #include "../core/memory.h"
 #include "../core/config.h"
+#include "../core/timing_trace.h"
 #include "../platform/platform.h"
 #include "../core/prof.h"
 
@@ -505,6 +506,8 @@ uint32_t spu2_block_trans_status(int channel) {
 void spu2_update() {
     ProfScope prof(P_EE_SOUND);
     uint64_t now = platform_time_us();
+    const bool timing_trace = eod_timing::enabled();
+    if (timing_trace) eod_timing::audio_call(now);
     if (!g_t0) {
         g_t0 = now;
         g_audio_open = g_config.audio && platform_audio_open(kRate);
@@ -512,6 +515,12 @@ void spu2_update() {
     }
     uint64_t due = (now - g_t0) * kRate / 1000000;
     if (due - g_produced < 64) return;  // ~1.3ms granularity
+    if (timing_trace) {
+        auto &s = eod_timing::state();
+        const uint64_t debt = due - g_produced;
+        s.audio_debt_max = std::max(s.audio_debt_max, debt);
+        if (debt > kRate / 10) s.audio_debt_dropped += debt - kRate / 10;
+    }
     if (due - g_produced > kRate / 10) g_produced = due - kRate / 10;  // fell behind: drop
     int frames = (int)(due - g_produced);
     g_produced = due;
@@ -528,6 +537,12 @@ void spu2_update() {
         tried = true;
         g_audio_open = platform_audio_open(kRate);
     }
-    if (g_audio_open && g_config.audio && platform_audio_queued_frames() < kRate / 5)
-        platform_audio_submit(buf.data(), frames);
+    const bool submit = g_audio_open && g_config.audio && platform_audio_queued_frames() < kRate / 5;
+    if (submit) platform_audio_submit(buf.data(), frames);
+    if (timing_trace) {
+        auto &s = eod_timing::state();
+        s.audio_mixed += frames;
+        if (!g_audio_open) s.audio_no_device += frames;
+        else if (!submit) s.audio_queue_suppressed += frames;
+    }
 }

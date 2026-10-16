@@ -11,3 +11,8 @@ SLUS_209.10
 system.cnf
 SYSTEM.CNF
 release/
+.venv/
+work/
+
+# Finder metadata is not project source.
+.DS_Store

@@ -29,8 +29,16 @@ void draw_sprite(const Env &e, const Vertex &a, const Vertex &b);
 void draw_line(const Env &e, const Vertex &a, const Vertex &b);
 void draw_point(const Env &e, const Vertex &a);
 
-// The CPU is about to write GS memory (host->local or local->local transfer).
+// The CPU is about to write these actual buffered pixels atomically. For a
+// host transfer this is each supplied chunk, not its declared TRXREG extent.
 void vram_written(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h);
+// All prepared CPU bytes are now supplied; upload proven complete storage
+// blocks into retained GPU owners without reading their untouched pixels back.
+#ifdef _WIN32
+inline void vram_write_complete() {}  // Direct3D 11 keeps its synchronous uploads
+#else
+void vram_write_complete();
+#endif
 // The CPU is about to read GS memory there (transfer source, CLUT load):
 // rendered contents are copied back to gs::vram first.
 void vram_needed(uint32_t bp, uint32_t bw, uint32_t psm, int x, int y, int w, int h, const char *why = "transfer");

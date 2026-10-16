@@ -7,13 +7,18 @@
 struct PlatformConfig {
     int width = 1280, height = 960;  // window client size
     bool fullscreen = false;         // borderless window over the whole monitor
-    int aspect = 0;                  // displayed image: 0 = 4:3, 1 = 16:9, 2 = stretched to the window
+    int aspect = 0;                  // displayed image: 0 = 4:3, 1 = 16:9, 2 = stretch, 3 = 16:10
     bool smooth = true;              // bilinear scaling of the image
     bool headless = false;     // no window (tests)
     bool vsync_throttle = true;
     const char *title = "Eve of Destruction";
 };
 
+// Set display-only state without creating windows, audio or input devices (replays).
+// (Non-Windows backends; on Windows these optional hooks are no-ops, see the end.)
+#ifndef _WIN32
+void platform_configure_display(const PlatformConfig &cfg);
+#endif
 bool platform_init(const PlatformConfig &cfg);
 void platform_shutdown();
 void platform_fatal_message(const char *msg);
@@ -41,6 +46,11 @@ int platform_cpu_count();
 // Physical cores among them (fewer than platform_cpu_count() with hyper-threading).
 int platform_core_count();
 void platform_sleep_us(uint32_t us);
+// Asks the OS to run the calling thread on a fast core (macOS: user-interactive
+// QoS, so the EE, GS and raster threads are not parked on efficiency cores).
+#ifndef _WIN32
+void platform_thread_fast();
+#endif
 
 // ------------------------------------------------------------------ input
 // DualShock 2 button bits as reported by padman (active high here; the pad
@@ -75,6 +85,12 @@ void platform_get_pad(int port, HostPadState *out);
 // The game controller alone (no keyboard), also while the in-game menu holds the game's input.
 void platform_get_controller(int port, HostPadState *out);
 void platform_set_vibration(int port, uint8_t small_motor, uint8_t large_motor);
+// `eod --list-pads [--watch N]`: prints the controllers the host sees (no game
+// data needed); with watch_seconds > 0 then shows each player's input live.
+// Returns the process exit code. (Non-Windows backends only.)
+#ifndef _WIN32
+int platform_list_pads(int watch_seconds);
+#endif
 
 // ------------------------------------------------------------------ audio
 // 48 kHz signed 16-bit stereo interleaved.
@@ -93,6 +109,10 @@ void fiber_delete(HostFiber *f);
 // ---------------------------------------------------------- timer thread
 // Calls cb() from a background thread roughly every period_us.
 void platform_start_ticker(void (*cb)(), unsigned period_us);
+// Stops and joins the ticker before shutdown (non-Windows backends).
+#ifndef _WIN32
+void platform_stop_ticker();
+#endif
 
 // --------------------------------------------------------------- files
 // Case-insensitive lookup of a relative path under a root directory.
@@ -108,3 +128,11 @@ struct DirEntryInfo {
 // Lists a directory (without "." and ".."). Returns false if it can't be read.
 #include <vector>
 bool platform_list_dir(const char *path, std::vector<DirEntryInfo> &out);
+
+#ifdef _WIN32
+// Hooks only the non-Windows (SDL3 / POSIX) backends implement; the Win32
+// backend keeps upstream's behaviour.
+inline void platform_configure_display(const PlatformConfig &) {}
+inline void platform_thread_fast() {}
+inline void platform_stop_ticker() {}
+#endif

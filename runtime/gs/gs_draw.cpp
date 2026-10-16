@@ -29,6 +29,7 @@
 #include "../core/prof.h"
 #include "../platform/platform.h"
 #include "gs_env.h"
+#include "gs_pixel_math.h"
 #include "gs_hw.h"
 #include "gs_mem.h"
 #include "gs_state.h"
@@ -77,7 +78,7 @@ const struct Env *g_env_snap;  // snapshot of g_env referenced by queued jobs
 void trace_prim(const char *kind, const Vertex *v, int n) {
     if (!g_trace) return;
     const Env &e = g_env;
-    char buf[512];
+    char buf[2048];
     int k = snprintf(buf, sizeof buf,
                      "%s fb=%x/%d/%x tme=%d fst=%d tex=%x bw=%d psm=%x %dx%d tfx=%d tcc=%d cpsm=%x abe=%d mxl=%d mmin=%d "
                      "lcm=%d l=%d k=%g mip1=%x/%d csa=%d blend=%d%d%d%d/%x ate=%d/%d/%x/%d date=%d/%d z=%d/%d/%x/%x zm=%d "
@@ -86,7 +87,7 @@ void trace_prim(const char *kind, const Vertex *v, int n) {
                      e.abe, e.mxl, e.mmin, e.lcm, e.l, e.k, e.mip_tbp[1], e.mip_tbw[1], e.csa, e.ba, e.bb, e.bc, e.bd,
                      e.bfix, e.ate, e.atst, e.aref, e.afail, e.date, e.datm, e.zte, e.ztst, e.zbp, e.zpsm, e.zmsk,
                      e.fge, e.fbmsk, e.iip, e.wms, e.wmt);
-    for (int i = 0; i < n; i++)
+    for (int i = 0; i < n && k >= 0 && k < (int)sizeof buf; i++)
         k += snprintf(buf + k, sizeof buf - k, " | %.1f,%.1f z%u c%02x%02x%02x%02x uv%d,%d st%.3f,%.3f,%.3f",
                       v[i].x / 16.0, v[i].y / 16.0, v[i].z, v[i].r, v[i].g, v[i].b, v[i].a, v[i].u, v[i].v, v[i].s,
                       v[i].t, v[i].q);
@@ -831,9 +832,9 @@ __attribute__((always_inline)) inline void shade_px_t(const Env &e, int x, const
     }
     if (e.fge) {
         int fo = f.fog;
-        r = (fo * r + (255 - fo) * (int)e.fogr) >> 8;
-        g = (fo * g + (255 - fo) * (int)e.fogg) >> 8;
-        b = (fo * b + (255 - fo) * (int)e.fogb) >> 8;
+        r = fog_channel(r, (int)e.fogr, fo);
+        g = fog_channel(g, (int)e.fogg, fo);
+        b = fog_channel(b, (int)e.fogb, fo);
     }
     // ---- alpha test
     bool write_fb = true, write_z = ZW, write_alpha = true;
@@ -1243,6 +1244,8 @@ struct Job {
 
 constexpr uint64_t kRing = 4096;
 Job *g_ring;
+std::vector<std::thread> g_raster_threads;
+std::atomic<bool> g_raster_stop{false};
 std::atomic<uint64_t> g_head{0};  // jobs published
 struct alignas(64) WorkerSync {
     std::atomic<uint64_t> done{0};
@@ -1334,19 +1337,21 @@ void run_job(const Job &j, int wid, int nw, WStats &ws) {
 }
 
 void raster_worker(int id) {
+    platform_thread_fast();
 #if defined(__linux__)
     pthread_setname_np(pthread_self(), "eod-raster");
 #endif
     t_wid = id + 1;
     uint64_t idx = 0;
     for (;;) {
+        if (g_raster_stop.load()) return;
         if (g_head.load() == idx) {
-            spin_until([&] { return g_head.load() != idx; }, g_spin_us);
+            spin_until([&] { return g_raster_stop.load() || g_head.load() != idx; }, g_spin_us);
             if (g_head.load() == idx) {
                 std::unique_lock<std::mutex> lk(g_wmtx);
                 g_dbg_sleeps++;
                 g_sleepers++;
-                g_wcv.wait(lk, [&] { return g_head.load() != idx; });
+                g_wcv.wait(lk, [&] { return g_raster_stop.load() || g_head.load() != idx; });
                 g_sleepers--;
             }
             continue;
@@ -1870,13 +1875,32 @@ void clut_load(uint64_t tex0) {
 void raster_start(int n) {
     if (n > kMaxWorkers) n = kMaxWorkers;
     if (n <= 0) return;
+    if (g_nw) return;
+    g_raster_stop = false;
+    g_head = 0;
+    for (int i = 0; i < n; ++i) g_wsync[i].done = 0;
     g_ring = new Job[kRing];
     g_nw = n;
     if (platform_core_count() < platform_cpu_count()) g_spin_us = 100;
-    for (int i = 0; i < n; i++) std::thread(raster_worker, i).detach();
+    for (int i = 0; i < n; i++) g_raster_threads.emplace_back(raster_worker, i);
 }
 
 void raster_sync() { barrier(); }
+
+void raster_shutdown() {
+    if (!g_nw) return;
+    barrier(); // No producer remains; finish every job before stopping workers.
+    {
+        std::lock_guard<std::mutex> lk(g_wmtx);
+        g_raster_stop = true;
+    }
+    g_wcv.notify_all();
+    for (auto &thread : g_raster_threads) thread.join();
+    g_raster_threads.clear();
+    g_nw = 0;
+    delete[] g_ring;
+    g_ring = nullptr;
+}
 
 void raster_reset() {
     barrier();

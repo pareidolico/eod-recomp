@@ -6,6 +6,7 @@
 // Interrupts are delivered only at safe points: loop back-edges in
 // recompiled code (IRQ_CHECK), syscalls and the idle loop.
 #include "kernel.h"
+#include "vblank_input.h"
 
 #include <atomic>
 #include <cstdlib>
@@ -14,6 +15,8 @@
 #include <vector>
 
 #include "../core/cpu.h"
+#include "../core/config.h"
+#include "../core/timing_trace.h"
 #include "../core/log.h"
 #include "../core/memory.h"
 #include "../gs/gs.h"
@@ -334,6 +337,8 @@ static void hold_for_menu() {
 // `run_alarms` (interrupts enabled).
 void service_events(bool run_alarms) {
     uint64_t now = platform_time_us();
+    const bool timing_trace = eod_timing::enabled();
+    if (timing_trace) eod_timing::service(now);
     iop_sound_update();
     debug_watch();
     if (!g_next_vblank_us) g_next_vblank_us = now + (uint64_t)kVblankPeriodUs;
@@ -342,6 +347,12 @@ void service_events(bool run_alarms) {
         intc_raise(INTC_VBLANK_E);
     }
     if (now >= g_next_vblank_us && !g_vblank_end_pending) {
+        if (timing_trace) {
+            auto &s = eod_timing::state();
+            s.vblank_debt_max = std::max(s.vblank_debt_max, now - g_next_vblank_us);
+            if (now > g_next_vblank_us + 13 * (uint64_t)kVblankPeriodUs) ++s.resyncs;
+            if (g_next_vblank_us + (uint64_t)kVblankPeriodUs <= now) ++s.catchups;
+        }
         g_vblank_count++;
         // Vblanks missed while the EE was busy are delivered back to back (the
         // game counts them as time), up to a few frames; beyond that, resync.
@@ -350,21 +361,60 @@ void service_events(bool run_alarms) {
         if (now > g_next_vblank_us + 12 * (uint64_t)kVblankPeriodUs) g_next_vblank_us = now + (uint64_t)kVblankPeriodUs;
         g_vblank_end_us = behind ? now : now + 1400;
         g_vblank_end_pending = true;
+        static const bool input_timing = getenv("EOD_INPUT_TIMING") != nullptr;
+        static uint64_t previous_input_us, last_timing_us, max_gap, max_pump_dma, max_gs_block;
+        static unsigned timing_lines;
+        uint64_t input_begin = input_timing ? platform_time_us() : 0;
+#ifdef _WIN32
         iop_pad_vblank();
+#else
+        // SDL refreshes keyboard/gamepad state while pumping events. Publish
+        // that fresh state before GS backpressure or this vblank's IRQ.
+        // (Windows pumps after the IRQ, below; the SDL3 port pumps first for latency.)
+        if (!vblank_poll_input()) {  // platform_pump + iop_pad_vblank
+            LOG(LOG_CORE, "window closed - exiting");
+            app_exit(0);
+        }
+#endif
         game_patches_vblank();
+        uint64_t input_end = (input_timing || timing_trace) ? platform_time_us() : 0;
         gs_vblank();
+        if (timing_trace) {
+            auto &s = eod_timing::state();
+            s.gs_block_max = std::max(s.gs_block_max, platform_time_us() - input_end);
+        }
+        if (input_timing) {
+            uint64_t gs_end = platform_time_us();
+            uint64_t gap = previous_input_us ? input_begin - previous_input_us : 0;
+            if (gap > max_gap) max_gap = gap;
+            if (input_end - input_begin > max_pump_dma) max_pump_dma = input_end - input_begin;
+            if (gs_end - input_end > max_gs_block) max_gs_block = gs_end - input_end;
+            if (!last_timing_us) last_timing_us = input_begin;
+            if (timing_lines < 120 && input_begin - last_timing_us >= 1000000) {
+                fprintf(stderr, "[input-timing] vblank=%llu max_pump_gap_us=%llu max_pump_dma_us=%llu max_gs_block_us=%llu\n",
+                        (unsigned long long)g_vblank_count, (unsigned long long)max_gap,
+                        (unsigned long long)max_pump_dma, (unsigned long long)max_gs_block);
+                ++timing_lines;
+                last_timing_us = input_begin;
+                max_gap = max_pump_dma = max_gs_block = 0;
+            }
+            previous_input_us = input_begin;
+        }
         if (g_vsync_flag_addr) {
             ee_w32(g_vsync_flag_addr, 1);
             if (g_vsync_flag_cnt_addr) MEM_SD(g_vsync_flag_cnt_addr, g_vblank_count);
         }
         intc_raise(INTC_VBLANK_S);
+#ifdef _WIN32
         if (!platform_pump()) {
             LOG(LOG_CORE, "window closed - exiting");
             app_exit(0);
         }
+#endif
         overlay_frame();
         if (overlay_paused()) hold_for_menu();
     }
+    if (timing_trace) eod_timing::report(platform_time_us(), g_vblank_count, g_config.frame_skip);
     for (int i = 0; i < 64 && run_alarms; i++) {
         Alarm &a = g_alarms[i];
         if (a.used && now >= a.due_us) {

@@ -77,6 +77,104 @@ needs the `EOD_DECOMP_TOKEN` secret to read the game's executable for the code
 generation; the executable is deleted before building and is in no archive.
 The game itself is not included.
 
+## macOS (Apple Silicon)
+
+All Mac work is consolidated on **`main`**. Developer review/build instructions: [contribution handoff](docs/DEVELOPER_HANDOFF.md).
+
+This fork adds a native arm64 Mac app with Vulkan/MoltenVK graphics, SDL3
+audio and two independent player ports for split screen. It is still a work
+in progress; [the player journey](docs/PLAYER_JOURNEY.md) distinguishes tested
+outcomes from remaining gaps.
+
+Open the locally built **Eve of Destruction.app** and select your own North
+American v1.00 PS2 ISO or disc folder when prompted. The app installs a local
+copy with progress and remembers it for later launches. No game files are
+included. The app bundles its runtime libraries; players do not need Homebrew
+or Xcode.
+
+The default **Racing** keyboard preset uses **WASD or arrows** to drive,
+**Space** to brake, and **Esc** to pause. In menus, WASD/arrows navigate,
+**Enter** accepts, and **Esc** goes back. Enter starts the title screen.
+**Original** keyboard layout preserves the per-PS2-button bindings. Mouse
+interaction is available in native dialogs; mouse steering/camera is unfinished.
+
+During play, **F1** or **Cmd+,** opens native settings for display size,
+fullscreen, aspect, smoothing, resolution scale, VSync, sound/volume,
+keyboard bindings/player port, vibration and save/disc locations. Settings
+are stored in `~/Library/Application Support/TDEODRecomp/eod.ini`; saves and
+the installed disc are beside it. The settings dialog identifies changes
+that require a relaunch. The current settings use standard Mac controls;
+game-themed presentation remains unfinished.
+
+With the default keyboard on player 1, the first controller takes player 2.
+For two controllers in plug order, set **Keyboard port** to **0** and restart.
+
+### Joining player two on Mac
+
+The original game's **“Press X for player 2”** means **PS2 Cross (✕)**, its
+Accept button. It does **not** mean the letter X on a Mac keyboard. The game
+still shows PS2 button artwork. Press **F2** during play for **Controls and
+player 2**: it lists the currently assigned devices and each player's menu
+Accept button, including custom Original keyboard bindings. Reopen it after
+connecting or unplugging a pad to refresh the assignments. Menu window titles
+and Settings also point to F2; automatic replacement of PS2 artwork remains
+unfinished.
+
+| Your setup | Settings before launch | What player two presses |
+| --- | --- | --- |
+| Keyboard for P1 + one controller for P2 | Keyboard port **1** (default); connect the controller | The controller's **bottom face button**: Xbox **A** or PlayStation **✕** |
+| Controller for P1 + keyboard for P2 | Keyboard port **2**, then restart | **Enter** with the Racing keyboard layout |
+| Two controllers | Keyboard port **0** (off), then restart; connect pads in player order | Bottom face button on the **second** controller |
+| One keyboard, no controller | Keyboard port **1** | Use **SINGLE**; a single keyboard currently controls one player and cannot join both ports |
+
+For a local race, navigate **ACTION → RACE → MULTI** with P1, then join and
+confirm P2 using P2's assigned device. Each player uses their own Accept button
+for their car selection. Continue through the original event/track choices.
+For a solo custom race, choose **SINGLE** instead. In menus, keyboard
+WASD/arrows navigate, **Enter** accepts and **Esc** goes back. During driving,
+Enter is not an extra accelerator binding; **W/Up** accelerates,
+**S/Down/Space** brakes and **A/D or Left/Right** steers.
+
+If the game asks you to insert a controller, check the keyboard player setting
+and controller assignment first. Choosing MULTI without a device assigned to P2
+does not create a second keyboard player. Scripted/virtual two-player checks
+pass; physical controller joining still needs hands-on confirmation.
+
+**Controller layout** offers Original (the default PS2 mapping) and Modern
+(analog RT gas / LT brake through Cross/Square pressure); restart after changing
+it. Modern is intended for the game's classic control schemes. Changing the
+game's own bindings can change which actions those inputs perform.
+Scripted two-player racing and virtual pads are verified; physical Rock Candy
+USB detection, trigger feel and rumble still need a connected device.
+
+Current rendering work: menu font interiors are corrected, and matched race
+captures support added horizontal scenery with preserved proportions. Full-speed
+4K multiplayer, the reported thin black lines and visible keyboard latency are
+still under investigation. CPU-upload preservation is now integrated for correctness; its full-game speed
+still needs acceptance. Complete-block GPU transfers are included but require
+`EOD_GPU_UPLOADS=1` until validated as a useful optimization. No separate branch
+assembly is required. See [current handoff and limits](docs/DEVELOPER_HANDOFF.md).
+
+Developer build steps, measured performance and known fidelity limits:
+[docs/MACOS.md](docs/MACOS.md). The immediate priority is an accurate, stable, full-speed native 1x baseline,
+then sequential 2x/4x/6x verification. After that, requested visual work includes
+much longer high-detail draw distances and correct widescreen/ultrawide culling, with
+quality settings for stronger Macs and high-end PCs at 8K. Maximum/Extreme tiers
+must not be limited to the owner's Mac; keep a playable Mac preset and a faithful
+baseline. CPU submission and asset streaming need separate work from GPU pixel
+cost. DLSS is deferred until the very last stage. This is planned work, not a claim of zero
+pop-in today. See [LOD/culling scope](docs/MODDING_SCOPE.md). High-refresh and
+other mods remain deferred.
+
+The [LOD/culling investigation](docs/LOD_CULLING_INVESTIGATION.md) identifies
+per-car load-time thresholds and the native CPU visibility test. These are
+implementation targets. An opt-in car LOD threshold experiment now validates
+20 real loaded tables in both original and 2x runs; matched visual acceptance is
+still pending. Track draw distance and quality tiers are not yet enabled. Native
+widescreen HUD edge anchors are implemented and CPU-tested; rendered checking
+is pending. See [LOD experiment](docs/LOD_RUNTIME.md) and
+[HUD anchor work](docs/HUD_EDGE_ANCHORS.md).
+
 ## Game files
 
 Copy the whole disc (at least `SLUS_209.10`, `SYSTEM.CNF` and the `DATA`

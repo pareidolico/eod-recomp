@@ -27,7 +27,12 @@
 #include "../hw/offload.h"
 #include "../kernel/kernel.h"
 #include "../platform/platform.h"
+#include "../platform/presentation.h"
 #include "gs_mem.h"
+#include "gs_replay_types.h"
+#include "gs_capture_io.h"
+#include <memory>
+#include "gs_transfer_chunk.h"
 #include "gs_state.h"
 #include "gs_swizzle.h"
 #include "../core/prof.h"
@@ -51,36 +56,8 @@ namespace {
 std::atomic<uint64_t> g_csr{0x551B8000ull};  // GS_CSR (shared by the EE and the GS thread)
 
 // ------------------------------------------------------------ GIF parsing
-struct PathState {
-    bool in_packet = false;
-    uint64_t tag_lo = 0, tag_hi = 0;
-    uint32_t nloop = 0;   // remaining loops
-    uint32_t nreg = 0;
-    uint32_t reg = 0;     // current register index within the loop
-    uint32_t flg = 0;
-    bool eop = false;
-};
 PathState g_path[4];
-
-// host -> local transfer state
-struct Transfer {
-    bool active = false;
-    uint32_t dbp, dbw, dpsm;
-    int x0, y0, w, h;
-    int x, y;
-    // partial pixel bytes for 24-bit and sub-word formats
-    uint8_t pend[16];
-    int pend_n = 0;
-    // address table and the current row
-    const SwizzleTab *T = nullptr;
-    int ry = -1;
-    uint32_t rb = 0, rc = 0;
-    // 32-bit: within a block row, pixels 2m and 2m+1 are adjacent words (pairs stored at once);
-    // 16, 8 and 4-bit: even pixels and the next one are adjacent in memory
-    bool pairs = false;
-    // 32-bit: the pairs of rows 2r and 2r+1 at the same x make aligned 16-byte groups
-    bool quads = false;
-} g_xfer;
+Transfer g_xfer;
 
 void vertex_kick(bool draw, uint64_t xyz, bool has_fog, uint8_t fog);
 
@@ -89,6 +66,49 @@ void write_reg(uint32_t reg, uint64_t v);
 uint32_t gif_reg_ctrl, gif_reg_mode;
 
 // --------------------------------------------------------------- transfer
+// Host->local transfers: on Windows (Direct3D 11) the declared TRXREG extent is
+// reported when the transfer starts, as upstream does; the other backends
+// report each supplied chunk from xfer_data (docs/GS_CPU_WRITE_PRESERVATION.md).
+#ifdef _WIN32
+constexpr bool kChunkedHostWrites = false;
+#else
+constexpr bool kChunkedHostWrites = true;
+#endif
+
+// Which fast paths the destination's swizzle allows (xfer_small, the 32-bit pair/quad stores).
+void xfer_layout(Transfer &t) {
+    t.pairs = false;
+    t.quads = false;
+    if (bits_per_pixel(t.dpsm) == 32 && t.dpsm != PSMCT24 && t.dpsm != PSMZ24) {
+        const SwizzleTab *T = t.T;
+        bool ok = T->colB[0] == T->colB[7];
+        for (int r = 0; r < 8 && ok; r++)
+            for (int m = 0; m < 8; m += 2) {
+                uint32_t a = T->colT[T->rowC[r] + T->colC[m]], b = T->colT[T->rowC[r] + T->colC[m + 1]];
+                if ((a & 1) || b != a + 1 || T->colC[m] != (uint16_t)m || T->colC[m + 1] != (uint16_t)(m + 1)) ok = false;
+            }
+        t.pairs = ok;
+        for (int y = 0; y < 64 && ok; y += 2) {
+            ok = T->rowB[y] == T->rowB[y + 1];
+            for (int m = 0; m < 8 && ok; m += 2) {
+                uint32_t a = T->colT[T->rowC[y] + T->colC[m]], b = T->colT[T->rowC[y + 1] + T->colC[m]];
+                ok = (a & 3) == 0 && b == a + 2;
+            }
+        }
+        t.quads = ok;
+    } else if (t.dpsm == PSMCT16 || t.dpsm == PSMCT16S || t.dpsm == PSMZ16 || t.dpsm == PSMZ16S || t.dpsm == PSMT8 ||
+               t.dpsm == PSMT4) {
+        const SwizzleTab *T = t.T;
+        bool ok = true;
+        for (int y = 0; y < 64 && ok; y++)
+            for (int x = 0; x < 128 && ok; x += 2) {
+                uint32_t a = T->addr(0, x, y);
+                ok = (a & 1) == 0 && T->addr(0, x + 1, y) == a + 1;
+            }
+        t.pairs = ok;
+    }
+}
+
 void xfer_start() {
     if (replay_frozen()) {
         g_xfer.active = false;
@@ -104,11 +124,11 @@ void xfer_start() {
     census_xfer((int)dir, sbp, sbw, spsm, dbp, dbw, dpsm, sx, sy, dx, dy, w, h);
     if (hw::g_on) {
         if (dir == 1 || dir == 2) hw::vram_needed(sbp, sbw, spsm, sx, sy, w, h, dir == 1 ? "local->host" : "local->local");
-        if (dir == 0 || dir == 2) hw::vram_written(dbp, dbw, dpsm, dx, dy, w, h);
+        if ((dir == 0 && !kChunkedHostWrites) || dir == 2) hw::vram_written(dbp, dbw, dpsm, dx, dy, w, h);
     }
     if (dir == 2) raster_vram_read(sbp, sbw, spsm, sx, sy, w, h);
     if (dir == 1) raster_sync();
-    if (dir == 0 || dir == 2) {
+    if ((dir == 0 && !kChunkedHostWrites) || dir == 2) {
         raster_vram_write(dbp, dbw, dpsm, dx, dy, w, h);
         vram_mark(dbp, dbw, dpsm, dx, dy, w, h);
     }
@@ -126,36 +146,7 @@ void xfer_start() {
         g_xfer.pend_n = 0;
         g_xfer.T = swizzle_table(dpsm, dbw);
         g_xfer.ry = -1;
-        g_xfer.pairs = false;
-        g_xfer.quads = false;
-        if (bits_per_pixel(dpsm) == 32 && dpsm != PSMCT24 && dpsm != PSMZ24) {
-            const SwizzleTab *T = g_xfer.T;
-            bool ok = T->colB[0] == T->colB[7];
-            for (int r = 0; r < 8 && ok; r++)
-                for (int m = 0; m < 8; m += 2) {
-                    uint32_t a = T->colT[T->rowC[r] + T->colC[m]], b = T->colT[T->rowC[r] + T->colC[m + 1]];
-                    if ((a & 1) || b != a + 1 || T->colC[m] != (uint16_t)m || T->colC[m + 1] != (uint16_t)(m + 1)) ok = false;
-                }
-            g_xfer.pairs = ok;
-            for (int y = 0; y < 64 && ok; y += 2) {
-                ok = T->rowB[y] == T->rowB[y + 1];
-                for (int m = 0; m < 8 && ok; m += 2) {
-                    uint32_t a = T->colT[T->rowC[y] + T->colC[m]], b = T->colT[T->rowC[y + 1] + T->colC[m]];
-                    ok = (a & 3) == 0 && b == a + 2;
-                }
-            }
-            g_xfer.quads = ok;
-        } else if (dpsm == PSMCT16 || dpsm == PSMCT16S || dpsm == PSMZ16 || dpsm == PSMZ16S || dpsm == PSMT8 ||
-                   dpsm == PSMT4) {
-            const SwizzleTab *T = g_xfer.T;
-            bool ok = true;
-            for (int y = 0; y < 64 && ok; y++)
-                for (int x = 0; x < 128 && ok; x += 2) {
-                    uint32_t a = T->addr(0, x, y);
-                    ok = (a & 1) == 0 && T->addr(0, x + 1, y) == a + 1;
-                }
-            g_xfer.pairs = ok;
-        }
+        xfer_layout(g_xfer);
         LOG(LOG_GSXFER, "transfer host->local bp=%x bw=%d psm=%x at %d,%d size %dx%d", dbp, dbw, dpsm, dx, dy, w, h);
     } else if (dir == 2) {
         LOG(LOG_GSXFER, "transfer local->local %x(%x)->%x(%x) %dx%d", sbp, spsm, dbp, dpsm, w, h);
@@ -167,6 +158,7 @@ void xfer_start() {
         for (int y = 0; y < h; y++)
             for (int x = 0; x < w; x++)
                 write_pixel(dpsm, (dx + x) & 2047, (dy + y) & 2047, dbp, dbw, tmp[(size_t)y * w + x]);
+        if (hw::g_on) hw::vram_write_complete();
     } else if (dir == 1) {
         static unsigned n;
         if (++n <= 8 || g_log_enabled[LOG_GSXFER])
@@ -241,11 +233,30 @@ void xfer_small(Transfer &t, const uint8_t *p, uint32_t n) {
 void xfer_data(const uint8_t *p, uint32_t n) {
     Transfer &t = g_xfer;
     if (!t.active) return;
+    // Source bytes are available now, unlike TRXREG's promised transfer size.
+    // Preserve partial GPU pages before writing, and invalidate caches/raster
+    // dependencies for every chunk (including an interrupted IMAGE packet).
+    if (kChunkedHostWrites) {
+        unsigned bpp = bits_per_pixel(t.dpsm);
+        uint64_t pixels = transfer_pixels_supplied(bpp, n, t.pend_n);
+        const auto regions = transfer_write_regions(t.x0, t.y0, t.w, t.h, t.x, t.y, pixels);
+        for (unsigned i = 0; i < regions.count; ++i) {
+            const auto &r = regions.rects[i];
+            if (hw::g_on) hw::vram_written(t.dbp, t.dbw, t.dpsm, r.x, r.y, r.w, r.h);
+            raster_vram_write(t.dbp, t.dbw, t.dpsm, r.x, r.y, r.w, r.h);
+            vram_mark(t.dbp, t.dbw, t.dpsm, r.x, r.y, r.w, r.h);
+        }
+    }
+    bool small = true;
     switch (t.dpsm) {
-    case PSMCT16: case PSMCT16S: case PSMZ16: case PSMZ16S: xfer_small<16>(t, p, n & ~1u); return;
-    case PSMT8: xfer_small<8>(t, p, n); return;
-    case PSMT4: xfer_small<4>(t, p, n); return;
-    default: break;
+    case PSMCT16: case PSMCT16S: case PSMZ16: case PSMZ16S: xfer_small<16>(t, p, n & ~1u); break;
+    case PSMT8: xfer_small<8>(t, p, n); break;
+    case PSMT4: xfer_small<4>(t, p, n); break;
+    default: small = false; break;
+    }
+    if (small) {
+        if (hw::g_on) hw::vram_write_complete();
+        return;
     }
     if (t.dpsm == PSMCT32 || t.dpsm == PSMZ32) {
         // whole runs of a row at a time
@@ -307,6 +318,7 @@ void xfer_data(const uint8_t *p, uint32_t n) {
                 t.y++;
             }
         }
+        if (hw::g_on) hw::vram_write_complete();
         if (t.y >= t.h) t.active = false;
         return;
     }
@@ -340,6 +352,7 @@ void xfer_data(const uint8_t *p, uint32_t n) {
         }
         break;
     }
+    if (hw::g_on) hw::vram_write_complete();
     if (t.y >= t.h) t.active = false;
 }
 
@@ -819,7 +832,7 @@ void priv_apply(uint32_t off, uint64_t v);
 void gs_flush();
 void gs_sync();
 [[noreturn]] void app_exit(int code);  // main.cpp
-void gs_frame_end(uint64_t frame);
+void gs_frame_end(uint64_t frame, int aspect);
 
 // ------------------------------------------------------------ GS thread
 // With a second CPU core the GIF stream is executed on a worker thread:
@@ -831,11 +844,21 @@ namespace {
 enum : uint32_t { CMD_GIF = 1, CMD_PRIV, CMD_VBLANK, CMD_PATH_RESET, CMD_REDRAW };
 
 bool g_threaded;
+bool g_gs_stop; // guarded by g_q_mtx
+std::thread g_gs_worker;
+bool g_shutdown_complete;
 // vblanks the GS thread may trail the EE (beyond that the EE waits; with
 // frame skipping the GS normally catches up by dropping frames first)
-uint64_t g_gs_max_lag = getenv("EOD_GS_LAG") ? (uint64_t)atoi(getenv("EOD_GS_LAG")) : 12;
+// Keep the Mac input-to-display queue short. This is a pacing/backpressure
+// bound, not a change to guest time or the game update frequency.
+#if defined(__APPLE__)
+constexpr uint64_t kDefaultGsLag = 2;
+#else
+constexpr uint64_t kDefaultGsLag = 12;
+#endif
+uint64_t g_gs_max_lag = getenv("EOD_GS_LAG") ? (uint64_t)atoi(getenv("EOD_GS_LAG")) : kDefaultGsLag;
 std::atomic<uint64_t> g_gs_busy_us, g_ee_wait_us, g_ee_sync_us;  // EOD_FPS statistics
-// never destroyed: the worker may still be waiting on them when the process exits
+// Process-lifetime queue storage; normal exits drain and join its worker.
 std::mutex &g_q_mtx = *new std::mutex;
 std::condition_variable &g_q_cv = *new std::condition_variable, &g_q_cv_done = *new std::condition_variable;
 // a command chunk: growing it doesn't zero the bytes about to be copied in
@@ -866,7 +889,7 @@ uint64_t g_frames_done;     // vblanks composed by the worker (guarded by g_q_mt
 // last composed frame (presented on the EE thread)
 std::mutex &g_pub_mtx = *new std::mutex;
 std::vector<uint32_t> g_pub;
-int g_pub_w, g_pub_h;
+int g_pub_w, g_pub_h, g_pub_aspect = -1;
 
 void push_cmd(uint32_t kind, uint32_t a, uint32_t b, const void *data, uint32_t size) {
     uint32_t h[4] = {kind, a, b, size};
@@ -880,7 +903,8 @@ void push_cmd(uint32_t kind, uint32_t a, uint32_t b, const void *data, uint32_t 
 }  // namespace
 
 // Publishes the display and does the per-frame bookkeeping (GS side).
-void gs_frame_end(uint64_t frame) {
+void gs_frame_end(uint64_t frame, int aspect) {
+    presentation::set(aspect);
     if (hw::g_on) {
         bool changed = display_changed();
         if (overlay_changed() || changed) {  // (the in-game menu or frame counter changed too)
@@ -894,6 +918,7 @@ void gs_frame_end(uint64_t frame) {
         g_pub.swap(g_frame);
         g_pub_w = g_frame_w;
         g_pub_h = g_frame_h;
+        g_pub_aspect = aspect;
     }
     {
         static int trace_at = getenv("EOD_GS_TRACE") ? atoi(getenv("EOD_GS_TRACE")) : -1;
@@ -958,46 +983,126 @@ void gs_sync() {
 // EOD_GS_DUMP=file EOD_GS_DUMP_AT=vblank [EOD_GS_DUMP_N=count] records the GS
 // state and VRAM after that vblank, then the commands of the next `count`
 // vblanks; `eod --gs-replay file` replays them alone (renderer benchmarks).
+// EOD_GS_DUMP_COLD_START=N instead records before the first queued command
+// through vblank N (1..6600), capped at 256 MiB, for packet-backend experiments.
 namespace {
 FILE *g_dump;
 uint64_t g_dump_end;
+uint64_t g_cold_dump_bytes;
+bool g_cold_dump;
+std::unique_ptr<capture::Writer> g_cold_zip;
 const char kDumpMagic[8] = {'E', 'O', 'D', 'G', 'S', 'D', '0', '1'};
 
-void dump_state(FILE *f) {
+void dump_state(FILE *f, capture::Writer *zip = nullptr) {
+    // Raster synchronization only drains CPU workers. Hardware-owned GS pages
+    // must also reach the CPU copy before serializing a replay's initial VRAM.
+    if (hw::g_on) {
+        hw::finish(); // Flush pending batches before consulting page ownership.
+        for (uint32_t p = 0; p < kPages; ++p)
+            hw::vram_needed(p * 32, 1, PSMCT32, 0, 0, 64, 32);
+    }
     uint32_t sizes[3] = {(uint32_t)sizeof st, (uint32_t)sizeof g_path, (uint32_t)sizeof g_xfer};
-    fwrite(kDumpMagic, 1, 8, f);
-    fwrite(sizes, 4, 3, f);
-    fwrite(&st, sizeof st, 1, f);
-    fwrite(g_path, sizeof g_path, 1, f);
-    fwrite(&g_xfer, sizeof g_xfer, 1, f);
-    fwrite(vram, 1, kVramSize, f);
+    auto write = [f, zip](const void *data, size_t size) {
+        if (zip) zip->write(data, size);
+        else fwrite(data, 1, size, f);
+    };
+    write(kDumpMagic, 8);
+    write(sizes, sizeof sizes);
+    write(&st, sizeof st);
+    write(g_path, sizeof g_path);
+    write(&g_xfer, sizeof g_xfer);
+    write(vram, kVramSize);
 }
 
-bool load_state(FILE *f) {
+template <typename Read> bool load_state_read(Read read) {
     char magic[8];
     uint32_t sizes[3];
-    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, kDumpMagic, 8) || fread(sizes, 4, 3, f) != 3 ||
+    if (read(magic, 8) != 8 || memcmp(magic, kDumpMagic, 8) || read(sizes, sizeof sizes) != sizeof sizes ||
         sizes[0] != sizeof st || sizes[1] != sizeof g_path || sizes[2] != sizeof g_xfer)
         return false;
-    bool ok = fread(&st, sizeof st, 1, f) == 1 && fread(g_path, sizeof g_path, 1, f) == 1 &&
-              fread(&g_xfer, sizeof g_xfer, 1, f) == 1 && fread(vram, 1, kVramSize, f) == kVramSize;
-    if (g_xfer.active) g_xfer.T = swizzle_table(g_xfer.dpsm, g_xfer.dbw);
+    bool ok = read(&st, sizeof st) == sizeof st && read(g_path, sizeof g_path) == sizeof g_path &&
+              read(&g_xfer, sizeof g_xfer) == sizeof g_xfer && read(vram, kVramSize) == kVramSize;
+    if (g_xfer.active) {
+        g_xfer.T = swizzle_table(g_xfer.dpsm, g_xfer.dbw);
+        xfer_layout(g_xfer);  // (not trusted from the capture: older ones have padding there)
+    }
     g_xfer.ry = -1;
     g_clut_gen++;
     g_reg_gen++;
     return ok;
 }
+bool load_state(FILE *f) {
+    return load_state_read([f](void *data, size_t size) { return fread(data, 1, size, f); });
+}
+bool load_state(capture::Reader &f) {
+    return load_state_read([&f](void *data, size_t size) { return f.read(data, size); });
+}
+void close_cold_zip(const char *reason) {
+    if (!g_cold_zip) return;
+    fprintf(stderr, "cold gzip GS dump %s (%llu compressed bytes; completed vblank members only)\n",
+            reason, (unsigned long long)g_cold_zip->bytes());
+    g_cold_zip.reset(); // Discard an unfinished member, if any.
+}
+
 }  // namespace
 
 // Runs queued GS commands; returns the last vblank seen.
 uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
+    // A bounded clean-start stream can seed an independent packet GS without
+    // guessing how to import its private CLUT, vertex or transfer state.
+    static bool cold_attempted = false;
+    if (live && !cold_attempted) {
+        cold_attempted = true;
+        const char *count = getenv("EOD_GS_DUMP_COLD_START");
+        const char *path = getenv("EOD_GS_DUMP");
+        const uint64_t n = count ? strtoull(count, nullptr, 10) : 0;
+        if (path && n && n <= 6600) {
+            g_dump_end = n;
+            if (capture::gzip_path(path)) {
+                uint64_t disk_mib, raw_gib;
+                if (!capture::parse_limit(getenv("EOD_GS_DUMP_COLD_MAX_MIB"), 1, 2048, 256, disk_mib) ||
+                    !capture::parse_limit(getenv("EOD_GS_DUMP_COLD_MAX_RAW_GIB"), 1, 64, 16, raw_gib)) {
+                    fprintf(stderr, "invalid cold GS limit: MAX_MIB must be 1..2048, MAX_RAW_GIB must be 1..64\n");
+                } else g_cold_zip = std::make_unique<capture::Writer>(path, disk_mib << 20, raw_gib << 30);
+                if (g_cold_zip && g_cold_zip->good()) {
+                    dump_state(nullptr, g_cold_zip.get());
+                    if (!g_cold_zip->checkpoint()) close_cold_zip("initial-state write failed");
+                } else if (g_cold_zip) {
+                    close_cold_zip("cannot open (requires zlib support)");
+                }
+            } else {
+                g_dump = fopen(path, "wb");
+                if (g_dump) {
+                    dump_state(g_dump);
+                    g_cold_dump = true;
+                    g_cold_dump_bytes = (uint64_t)ftell(g_dump);
+                }
+            }
+        }
+    }
     uint64_t frames = 0;
     for (size_t p = 0; p < size;) {
         uint32_t h[4];
         memcpy(h, &c[p], 16);
         const uint8_t *d = &c[p + 16];
         size_t len = 16 + ((h[3] + 15) & ~15u);
-        if (live && g_dump) fwrite(&c[p], 1, len, g_dump);
+        if (live && g_cold_zip) {
+            if (!g_cold_zip->write(&c[p], len)) close_cold_zip("stopped at decoded/pending limit or compression error");
+            else if (h[0] == CMD_VBLANK && !g_cold_zip->checkpoint())
+                close_cold_zip("stopped at compressed limit or write error");
+        }
+        if (live && g_dump) {
+            // Never let a diagnostic boot trace grow without a bound. Close at
+            // a command boundary so even a size-limited trace stays parseable.
+            if (g_cold_dump && g_cold_dump_bytes + len > 256ull * 1024 * 1024) {
+                fclose(g_dump);
+                g_dump = nullptr;
+                fprintf(stderr, "cold GS dump reached 256 MiB limit\n");
+            } else {
+                fwrite(&c[p], 1, len, g_dump);
+                g_cold_dump_bytes += len;
+            }
+        }
         switch (h[0]) {
         case CMD_GIF: gif_process((int)h[1], d, h[3] / 16); break;
         case CMD_PRIV: {
@@ -1008,9 +1113,10 @@ uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
         }
         case CMD_VBLANK:
             g_gs_vblanks = h[1];
-            gs_frame_end(h[1]);
+            gs_frame_end(h[1], presentation::from_tag(h[2]));
             frames = h[1];
             if (live) {
+                if (g_cold_zip && h[1] >= g_dump_end) close_cold_zip("written");
                 // EOD_GS_DUMP_AT may list several vblanks (a,b,c): one file per
                 // capture, named <EOD_GS_DUMP>.<vblank> when there are several
                 static const char *dump = getenv("EOD_GS_DUMP");
@@ -1035,8 +1141,15 @@ uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
                     raster_sync();
                     std::string name = dump;
                     if (at_list.size() > 1) name += "." + std::to_string(h[1]);
+                    if (capture::gzip_path(name.c_str())) {
+                        fprintf(stderr, "gzip capture requires EOD_GS_DUMP_COLD_START; snapshot capture not opened\n");
+                        break;
+                    }
                     g_dump = fopen(name.c_str(), "wb");
-                    if (g_dump) dump_state(g_dump);
+                    if (g_dump) {
+                        g_cold_dump = false;
+                        dump_state(g_dump);
+                    }
                     g_dump_end = h[1] + (getenv("EOD_GS_DUMP_N") ? strtoull(getenv("EOD_GS_DUMP_N"), nullptr, 10) : 4);
                 }
             }
@@ -1057,26 +1170,42 @@ uint64_t run_cmds(const uint8_t *c, size_t size, bool live) {
 // and writes the last frame to FILE.ppm.
 int gs_replay(const char *path, int repeat) {
     mem_init();
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        fprintf(stderr, "can't open %s\n", path);
+    const char *measure_env = getenv("EOD_GS_REPLAY_MEASURE_AT");
+    const char *stop_env = getenv("EOD_GS_REPLAY_STOP_AT");
+    const uint64_t measure_at = measure_env ? strtoull(measure_env, nullptr, 10) : 0;
+    const uint64_t stop_at = stop_env ? strtoull(stop_env, nullptr, 10) : 0;
+    if (repeat < 1 || (stop_env && (!stop_at || stop_at <= measure_at))) {
+        fprintf(stderr, "invalid GS replay repeat/window (stop must be after measure vblank)\n");
+        return 1;
+    }
+    const bool streaming = capture::gzip_path(path) || measure_env || stop_env;
+    capture::Reader input(path);
+    FILE *f = streaming ? nullptr : fopen(path, "rb");
+    if ((!streaming && !f) || (streaming && !input.good())) {
+        fprintf(stderr, "can't open %s%s\n", path,
+                capture::gzip_path(path) ? " (gzip input requires zlib support)" : "");
         return 1;
     }
     long start = 0;
     {
         std::vector<uint8_t> tmp;
-        if (!load_state(f)) {
-            fprintf(stderr, "%s is not a GS capture from this build\n", path);
+        if (!(streaming ? load_state(input) : load_state(f))) {
+            fprintf(stderr, "%s is not a GS capture from this build (gzip requires zlib)\n", path);
+            if (f) fclose(f);
             return 1;
         }
-        start = ftell(f);
+        if (f) start = ftell(f);
     }
-    fseek(f, 0, SEEK_END);
-    long end = ftell(f);
-    std::vector<uint8_t> cmds((size_t)(end - start));
-    fseek(f, start, SEEK_SET);
-    if (fread(cmds.data(), 1, cmds.size(), f) != cmds.size()) return 1;
-    if ((g_config.renderer == "d3d11" || g_config.renderer == "warp") && hw::start(false)) fprintf(stderr, "replaying with Direct3D 11\n");
+    std::vector<uint8_t> cmds;
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        long end = ftell(f);
+        if (end < start) { fclose(f); return 1; }
+        cmds.resize((size_t)(end - start));
+        fseek(f, start, SEEK_SET);
+        if (fread(cmds.data(), 1, cmds.size(), f) != cmds.size()) { fclose(f); return 1; }
+    }
+    if ((g_config.renderer == "d3d11" || g_config.renderer == "warp" || g_config.renderer == "vulkan") && hw::start(false)) fprintf(stderr, "replaying with %s\n",g_config.renderer.c_str());
     int hw = platform_cpu_count();
     int n = hw >= 4 ? hw - 2 : hw == 3 ? 1 : 0;
     if (const char *r = getenv("EOD_GS_RASTER")) n = atoi(r);
@@ -1084,8 +1213,12 @@ int gs_replay(const char *path, int repeat) {
     raster_start(n);
     double best = 1e30;
     for (int r = 0; r < repeat; r++) {
-        fseek(f, 0, SEEK_SET);
-        load_state(f);
+        if (streaming) {
+            if (!input.rewind() || !load_state(input)) return 1;
+        } else {
+            fseek(f, 0, SEEK_SET);
+            if (!load_state(f)) { fclose(f); return 1; }
+        }
         raster_reset();
         if (hw::g_on) hw::reset();
         // EOD_GS_REPLAY_TRACE: log every primitive of the first replay
@@ -1093,7 +1226,85 @@ int gs_replay(const char *path, int repeat) {
         gs::g_trace = replay_trace && r == 0;
         uint64_t t0 = platform_time_us(), tk0 = prof_ticks();
         prof_thread_begin(P_GS_CMDS);
-        run_cmds(cmds.data(), cmds.size(), false);
+        if (!streaming) run_cmds(cmds.data(), cmds.size(), false);
+        else if (measure_env && stop_env) {
+            // Only the short measured interval is buffered. Parsing/decompression
+            // can let warm GPU work retire, so drain it after loading the window,
+            // then time a single contiguous dispatch with complete GPU work.
+            std::vector<uint8_t> command, window;
+            uint64_t last_vblank = 0;
+            bool warm = measure_at == 0, reached_stop = false;
+            int status = 0;
+            while ((status = input.command(command)) == 1) {
+                uint32_t h[4]; memcpy(h, command.data(), sizeof h);
+                if (!warm) {
+                    run_cmds(command.data(), command.size(), false);
+                    if (h[0] == CMD_VBLANK) {
+                        last_vblank = h[1];
+                        if (last_vblank >= measure_at) {
+                            if (last_vblank != measure_at) break;
+                            warm = true;
+                        }
+                    }
+                    continue;
+                }
+                if (command.size() > (256u << 20) - window.size()) {
+                    fprintf(stderr, "GS replay measured interval exceeds 256 MiB buffer limit\n");
+                    return 1;
+                }
+                window.insert(window.end(), command.begin(), command.end());
+                if (h[0] == CMD_VBLANK) {
+                    last_vblank = h[1];
+                    if (last_vblank >= stop_at) {
+                        reached_stop = last_vblank == stop_at;
+                        break;
+                    }
+                }
+            }
+            if (status < 0 || !warm || !reached_stop || window.empty()) {
+                fprintf(stderr, "GS replay invalid/truncated or exact requested window not reached (last vblank %llu)\n",
+                        (unsigned long long)last_vblank);
+                return 1;
+            }
+            raster_sync(); if (hw::g_on) hw::finish();
+            const uint64_t render_start = platform_time_us();
+            run_cmds(window.data(), window.size(), false);
+            raster_sync(); if (hw::g_on) hw::finish();
+            const uint64_t render_us = platform_time_us() - render_start;
+            fprintf(stderr, "GS render window (%llu,%llu]: %.3f ms (contiguous wall time; parsing/I/O/output excluded; completion included)\n",
+                    (unsigned long long)measure_at, (unsigned long long)stop_at, render_us / 1000.0);
+        } else {
+            std::vector<uint8_t> command;
+            uint64_t last_vblank = 0, dispatch_us = 0;
+            bool measuring = measure_at == 0, started = measuring, complete_boundary = false;
+            int status;
+            while ((status = input.command(command)) == 1) {
+                uint32_t h[4]; memcpy(h, command.data(), sizeof h);
+                const uint64_t tick = platform_time_us();
+                run_cmds(command.data(), command.size(), false);
+                complete_boundary = h[0] == CMD_VBLANK;
+                if (measuring) dispatch_us += platform_time_us() - tick;
+                if (h[0] != CMD_VBLANK) continue;
+                last_vblank = h[1];
+                if (!measuring && last_vblank >= measure_at) {
+                    raster_sync(); if (hw::g_on) hw::finish();
+                    measuring = started = true;
+                    dispatch_us = 0;
+                }
+                if (stop_at && last_vblank >= stop_at) break;
+            }
+            const uint64_t drain = platform_time_us();
+            raster_sync(); if (hw::g_on) hw::finish();
+            if (measuring) dispatch_us += platform_time_us() - drain;
+            if (status < 0 || !started || !complete_boundary || last_vblank <= measure_at ||
+                (stop_at && last_vblank < stop_at)) {
+                fprintf(stderr, "GS replay invalid/truncated or requested window not reached (last vblank %llu)\n",
+                        (unsigned long long)last_vblank);
+                return 1;
+            }
+            fprintf(stderr, "GS diagnostic dispatch window (%llu,%llu]: %.3f ms (parsing/I/O/output excluded; completion included)\n",
+                    (unsigned long long)measure_at, (unsigned long long)last_vblank, dispatch_us / 1000.0);
+        }
         raster_sync();
         prof_switch(P_GS_IDLE);
         {
@@ -1125,7 +1336,7 @@ int gs_replay(const char *path, int repeat) {
         best = std::min(best, ms);
         fprintf(stderr, "replay %d: %.1f ms\n", r + 1, ms);
     }
-    fclose(f);
+    if (f) fclose(f);
     raster_collect_stats();
     fprintf(stderr, "best %.1f ms, %d raster workers; per replay: %u prims, %u pixels, %llu game frames\n", best, n,
             stats.prims / repeat, stats.pixels / repeat, (unsigned long long)(g_flips.load() / repeat));
@@ -1143,6 +1354,7 @@ int gs_replay(const char *path, int repeat) {
 }
 
 static void gs_worker() {
+    platform_thread_fast();
 #if defined(__linux__)
     pthread_setname_np(pthread_self(), "eod-gs");
 #endif
@@ -1153,7 +1365,8 @@ static void gs_worker() {
         {
             ProfScope prof(P_GS_IDLE);
             std::unique_lock<std::mutex> lk(g_q_mtx);
-            g_q_cv.wait(lk, [] { return !g_q.empty(); });
+            g_q_cv.wait(lk, [] { return g_gs_stop || !g_q.empty(); });
+            if (g_gs_stop && g_q.empty()) break;
             c = std::move(g_q.front());
             g_q.pop_front();
         }
@@ -1168,24 +1381,53 @@ static void gs_worker() {
         }
         g_q_cv_done.notify_all();
     }
+    raster_sync();
+    if (hw::g_on) hw::finish(); // Finish rendering on its owning thread.
 }
 
 void gs_thread_start() {
     const char *e = getenv("EOD_GS_THREAD");
     bool want = e ? atoi(e) != 0 : platform_cpu_count() >= 2;
     if (!want) return;
+    g_gs_stop = false;
     g_threaded = true;
-    std::thread(gs_worker).detach();
+    g_gs_worker = std::thread(gs_worker);
     offload_start();
     // raster workers on the cores left after the EE and GS threads
     // (EOD_GS_RASTER=n overrides, 0 disables)
     int hw = platform_cpu_count();
     int n = hw >= 4 ? hw - 2 : hw == 3 ? 1 : 0;
-    if (const char *r = getenv("EOD_GS_RASTER")) n = atoi(r);
     if (n > 4) n = 4;
+    if (const char *r = getenv("EOD_GS_RASTER")) n = atoi(r);  // an explicit count is not capped
     if (hw::g_on) n = 0;  // the GPU draws
     raster_start(n);
     LOG(LOG_GS, "GS runs on its own thread, %d raster workers", n > 0 ? n : 0);
+}
+
+void gs_shutdown() {
+    if (g_shutdown_complete) return;
+    g_shutdown_complete = true;
+    // Called by normal exit paths before static destruction. The EE has
+    // stopped issuing work. Stop its ticker, then the VIF/GIF producer before
+    // draining the GS stream; GS may still reference raster jobs and caches.
+    platform_stop_ticker();
+    offload_shutdown();
+    if (g_threaded) {
+        gs_sync();
+        {
+            std::lock_guard<std::mutex> lk(g_q_mtx);
+            g_gs_stop = true;
+        }
+        g_q_cv.notify_all();
+        g_gs_worker.join();
+        g_threaded = false;
+    } else {
+        raster_sync();
+        if (hw::g_on) hw::finish();
+    }
+    close_cold_zip("closed at shutdown");
+    if (g_dump) { fclose(g_dump); g_dump = nullptr; }
+    raster_shutdown();
 }
 
 void gs_init() {
@@ -1193,11 +1435,11 @@ void gs_init() {
     memset(&st, 0, sizeof st);
     st.imr = 0xFF00;
     st.prmodecont = 1;
-    if (g_config.renderer == "d3d11" || g_config.renderer == "warp") {
+    if (g_config.renderer == "d3d11" || g_config.renderer == "warp" || g_config.renderer == "vulkan") {
         if (hw::start(platform_native_window() != nullptr && !getenv("EOD_D3D_NOWINDOW")))
-            LOG(LOG_GS, "Direct3D 11 renderer");
+            LOG(LOG_GS, "%s renderer",g_config.renderer.c_str());
         else
-            LOG(LOG_GS, "Direct3D 11 is not available - using the software renderer");
+            LOG(LOG_GS, "%s is not available - using the software renderer",g_config.renderer.c_str());
     }
     gs_thread_start();
 }
@@ -1454,8 +1696,9 @@ void gs_vblank() {
     log_frame(g_frames);
     if (g_threaded) {
         uint64_t f = g_frames;
-        offload_run([f] {
-            push_cmd(CMD_VBLANK, (uint32_t)f, 0, nullptr, 0);
+        const uint32_t aspect = presentation::tag(eod_presentation_aspect());
+        offload_run([f, aspect] {
+            push_cmd(CMD_VBLANK, (uint32_t)f, aspect, nullptr, 0);
             gs_flush();
         });
         // don't let the GS thread fall more than a couple of frames behind
@@ -1465,11 +1708,14 @@ void gs_vblank() {
         g_q_cv_done.wait(lk, [] { return g_frames_done + g_gs_max_lag >= g_frames; });
         g_ee_wait_us += platform_time_us() - t;
     } else {
-        gs_frame_end(g_frames);
+        gs_frame_end(g_frames, eod_presentation_aspect());
     }
     {
         std::lock_guard<std::mutex> lk(g_pub_mtx);
-        if (!g_pub.empty()) platform_present(g_pub.data(), g_pub_w, g_pub_h, g_pub_w);
+        if (!g_pub.empty()) {
+            presentation::set(g_pub_aspect);
+            platform_present(g_pub.data(), g_pub_w, g_pub_h, g_pub_w);
+        }
     }
     {
         // speed in the window title, every second
